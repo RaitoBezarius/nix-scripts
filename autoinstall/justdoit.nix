@@ -17,13 +17,23 @@ in { rootDevice ? "/dev/sda", bootSize ? 256, bootType ? "vfat", swapSize ? 1024
 
       set -e
 
+      cleanup () {
+        ARG=$?
+        echo "> Cleaning up."
+        umount -R /mnt
+        ${lib.optionalString luksEncrypt "cryptsetup luksClose /dev/mapper/root"}
+        swapoff $SWAP_DEVICE
+        exit $ARG
+      }
+      trap cleanup EXIT
+
       wipefs -a ${rootDevice}
       dd if=/dev/zero of=${rootDevice} bs=512 count=10000
       sfdisk ${rootDevice} <<EOF
       label: gpt
       device: ${rootDevice}
       unit: sectors
-      1 : size=${toString (2048 * bootSize)}, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4
+      1 : size=${toString (2048 * bootSize)}, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
       ${lib.optionalString (! uefi) "4 : size=4096, type=21686148-6449-6E6F-744E-656564454649"}
       2 : size=${toString (2048 * swapSize)}, type=0657FD6D-A4AB-43C4-84E5-0933C84B4F4F
       3 : type=0FC63DAF-8483-4772-8E79-3D69D8477DE4
@@ -64,7 +74,7 @@ in { rootDevice ? "/dev/sda", bootSize ? 256, bootType ? "vfat", swapSize ? 1024
 
         hostId=$(echo $(head -c4 /dev/urandom | od -A none -t x4))
         ${if externalConfig != null then ''
-          echo > /mnt/etc/nixos/configuration.nix <<EOF
+          echo > /mnt/etc/nixos/external-configuration.nix <<EOF
           ${builtins.readFile (./. + "${externalConfig}")}
           EOF
         '' else ""}
@@ -73,35 +83,30 @@ in { rootDevice ? "/dev/sda", bootSize ? 256, bootType ? "vfat", swapSize ? 1024
           nix run nixpkgs.dropbear -c dropbearkey -t ecdsa -f /mnt/persist/host_ecdsa_key
         ''}
 
-        cat > /mnt/etc/nixos/generated.nix <<EOF
+        mv /mnt/etc/nixos/configuration.nix /mnt/etc/nixos/nixos-generated.nix
+        cat > /mnt/etc/nixos/configuration.nix <<EOF
         { ... }:
         {
-        ${if uefi then ''
+          imports = [ ./hardware-configuration.nix ./nixos-generated.nix ./impl-generated.nix ${lib.optionalString (externalConfig != null) "./external-configuration.nix"}];
+        }
+      EOF
 
-        '' else ''
-          boot.loader.grub.device = "${rootDevice}";
-        ''}
-
-          ${lib.optionalString luksEncrypt ''
-            boot.initrd.luks.devices = [
-            { name = "root"; device = "${rootDevice}${x}3"; }
-            ];
+        cat > /mnt/etc/nixos/impl-generated.nix <<EOF
+        { ... }:
+        {
                 ${lib.optionalString remoteUnlock ''
                   boot.initrd.network = {
                     enable = true;
                     ssh = { enable = true; port = 22; authorizedKeys = ${generators.toPretty {} authorizedKeys}; hostECDSAKey = /persist/host_ecdsa_key; };
                   };
-                  services.openssh.hostKeys = [ { path = "/persist/host_ecdsa_key"; } ];
-                  users.users.root.openssh.authorizedKeys = ${generators.toPretty {} authorizedKeys};
+                  services.openssh.hostKeys = [ { path = "/persist/host_ecdsa_key"; type = "ecdsa"; } ];
+                  users.users.root.openssh.authorizedKeys.keys = ${generators.toPretty {} authorizedKeys};
                   services.openssh.enable = true;
               ''}
-          ''}
             }
       EOF
-            nix run nixpkgs.nixfmt -c nixfmt /mnt/etc/nixos/generated.nix /mnt/etc/nixos/configuration.nix
+            nix run nixpkgs.nixfmt -c nixfmt /mnt/etc/nixos/*.nix
 
             nixos-install
-
-            umount /mnt/home /mnt/nix /mnt/boot /mnt
-            swapoff $SWAP_DEVICE
-          ''
+            cleanup
+                 ''
